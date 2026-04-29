@@ -1,0 +1,328 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from utils import CATEGORICAL_FEATURES, DEFAULT_DATA_PATH, NUMERIC_FEATURES, load_heart_disease_dataset
+
+
+SEARCH_SPACE = {
+    "n_estimators": [50, 75, 100, 125, 150, 200],
+    "max_depth": [3, 5, 7, 10, None],
+    "min_samples_split": [2, 4, 6, 8, 10],
+    "min_samples_leaf": [1, 2, 3, 4],
+    "max_features": ["sqrt", "log2", None],
+}
+
+DEFAULT_PARAMETERS = {
+    "n_estimators": 100,
+    "max_depth": None,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "max_features": "sqrt",
+}
+
+
+@dataclass
+class ShowcaseConfig:
+    population_size: int = 14
+    generations: int = 8
+    mutation_rate: float = 0.18
+    random_state: int = 42
+
+
+def build_preprocessor() -> ColumnTransformer:
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, NUMERIC_FEATURES),
+            ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),
+        ]
+    )
+
+
+def build_model(parameters: dict[str, Any], random_state: int = 42) -> Pipeline:
+    classifier = RandomForestClassifier(
+        n_estimators=int(parameters["n_estimators"]),
+        max_depth=parameters["max_depth"],
+        min_samples_split=int(parameters["min_samples_split"]),
+        min_samples_leaf=int(parameters["min_samples_leaf"]),
+        max_features=parameters["max_features"],
+        random_state=random_state,
+        n_jobs=1,
+    )
+    return Pipeline(
+        steps=[
+            ("preprocessor", build_preprocessor()),
+            ("classifier", classifier),
+        ]
+    )
+
+
+def chromosome_key(parameters: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(parameters[key] for key in SEARCH_SPACE)
+
+
+def _choose(values: list[Any], rng) -> Any:
+    value = rng.choice(values)
+    return value.item() if hasattr(value, "item") else value
+
+
+def random_chromosome(rng) -> dict[str, Any]:
+    return {key: _choose(values, rng) for key, values in SEARCH_SPACE.items()}
+
+
+def calculate_fitness(accuracy: float, training_time: float, baseline_time: float) -> tuple[float, float]:
+    time_score = baseline_time / (baseline_time + training_time + 1e-9)
+    fitness = (0.80 * accuracy) + (0.20 * time_score)
+    return float(time_score), float(fitness)
+
+
+def evaluate_parameters(
+    parameters: dict[str, Any],
+    x_train: pd.DataFrame,
+    x_eval: pd.DataFrame,
+    y_train: pd.Series,
+    y_eval: pd.Series,
+    baseline_time: float,
+    generation: int,
+    random_state: int,
+) -> dict[str, Any]:
+    model = build_model(parameters, random_state=random_state)
+    start_time = time.perf_counter()
+    model.fit(x_train, y_train)
+    training_time = time.perf_counter() - start_time
+
+    predictions = model.predict(x_eval)
+    accuracy = accuracy_score(y_eval, predictions)
+    time_score, fitness = calculate_fitness(accuracy, training_time, baseline_time)
+
+    return {
+        "generation": generation,
+        "parameters": dict(parameters),
+        "accuracy": float(accuracy),
+        "training_time": float(training_time),
+        "time_score": time_score,
+        "fitness": fitness,
+    }
+
+
+def dominates(candidate_a: dict[str, Any], candidate_b: dict[str, Any]) -> bool:
+    no_worse = (
+        candidate_a["accuracy"] >= candidate_b["accuracy"]
+        and candidate_a["training_time"] <= candidate_b["training_time"]
+    )
+    strictly_better = (
+        candidate_a["accuracy"] > candidate_b["accuracy"]
+        or candidate_a["training_time"] < candidate_b["training_time"]
+    )
+    return no_worse and strictly_better
+
+
+def pareto_front(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    front = []
+    for candidate in candidates:
+        dominated = any(dominates(other, candidate) for other in candidates if other is not candidate)
+        if not dominated:
+            front.append(candidate)
+    return sorted(front, key=lambda item: (item["training_time"], -item["accuracy"]))
+
+
+def tournament_selection(population: list[dict[str, Any]], rng, size: int = 3) -> dict[str, Any]:
+    contenders = list(rng.choice(population, size=min(size, len(population)), replace=False))
+    return max(contenders, key=lambda item: item["fitness"])
+
+
+def crossover(parent_a: dict[str, Any], parent_b: dict[str, Any], rng) -> dict[str, Any]:
+    child = {}
+    for key in SEARCH_SPACE:
+        child[key] = parent_a["parameters"][key] if rng.random() < 0.5 else parent_b["parameters"][key]
+    return child
+
+
+def mutate(parameters: dict[str, Any], mutation_rate: float, rng) -> dict[str, Any]:
+    mutated = dict(parameters)
+    for key, values in SEARCH_SPACE.items():
+        if rng.random() < mutation_rate:
+            choices = [value for value in values if value != mutated[key]]
+            mutated[key] = _choose(choices, rng)
+    return mutated
+
+
+def run_showcase_simulation(
+    config: ShowcaseConfig,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    rng = np.random.default_rng(config.random_state)
+    dataframe = load_heart_disease_dataset(DEFAULT_DATA_PATH)
+    features = dataframe.drop(columns=["target", "target_raw"])
+    target = dataframe["target"]
+
+    x_train_full, x_test, y_train_full, y_test = train_test_split(
+        features,
+        target,
+        test_size=0.20,
+        stratify=target,
+        random_state=config.random_state,
+    )
+    x_train, x_validation, y_train, y_validation = train_test_split(
+        x_train_full,
+        y_train_full,
+        test_size=0.25,
+        stratify=y_train_full,
+        random_state=config.random_state,
+    )
+
+    baseline_probe = evaluate_parameters(
+        DEFAULT_PARAMETERS,
+        x_train,
+        x_validation,
+        y_train,
+        y_validation,
+        baseline_time=1.0,
+        generation=0,
+        random_state=config.random_state,
+    )
+    baseline_validation = evaluate_parameters(
+        DEFAULT_PARAMETERS,
+        x_train,
+        x_validation,
+        y_train,
+        y_validation,
+        baseline_time=baseline_probe["training_time"],
+        generation=0,
+        random_state=config.random_state,
+    )
+
+    population_parameters = [random_chromosome(rng) for _ in range(config.population_size)]
+    cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    all_candidates: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+
+    for generation in range(1, config.generations + 1):
+        evaluated_population = []
+        for parameters in population_parameters:
+            key = chromosome_key(parameters)
+            if key not in cache:
+                cache[key] = evaluate_parameters(
+                    parameters,
+                    x_train,
+                    x_validation,
+                    y_train,
+                    y_validation,
+                    baseline_time=baseline_validation["training_time"],
+                    generation=generation,
+                    random_state=config.random_state,
+                )
+                all_candidates.append(cache[key])
+            evaluated_population.append({**cache[key], "generation": generation})
+
+        best_candidate = max(evaluated_population, key=lambda item: item["fitness"])
+        history.append(
+            {
+                "generation": generation,
+                "best_accuracy": best_candidate["accuracy"],
+                "best_training_time": best_candidate["training_time"],
+                "best_fitness": best_candidate["fitness"],
+            }
+        )
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "generation": generation,
+                    "total_generations": config.generations,
+                    "accuracy": best_candidate["accuracy"],
+                    "training_time": best_candidate["training_time"],
+                    "fitness": best_candidate["fitness"],
+                }
+            )
+
+        ordered_population = sorted(evaluated_population, key=lambda item: item["fitness"], reverse=True)
+        elite_count = max(2, config.population_size // 5)
+        next_population = [item["parameters"] for item in ordered_population[:elite_count]]
+
+        while len(next_population) < config.population_size:
+            parent_a = tournament_selection(evaluated_population, rng)
+            parent_b = tournament_selection(evaluated_population, rng)
+            child = crossover(parent_a, parent_b, rng)
+            child = mutate(child, config.mutation_rate, rng)
+            next_population.append(child)
+
+        population_parameters = next_population
+
+    front = pareto_front(all_candidates)
+    # For a classroom showcase, choose the most accurate Pareto solution first,
+    # then prefer the faster one when accuracy is tied.
+    selected_candidate = max(front, key=lambda item: (item["accuracy"], -item["training_time"], item["fitness"]))
+
+    baseline_test = evaluate_parameters(
+        DEFAULT_PARAMETERS,
+        x_train_full,
+        x_test,
+        y_train_full,
+        y_test,
+        baseline_time=baseline_validation["training_time"],
+        generation=0,
+        random_state=config.random_state,
+    )
+    optimized_test = evaluate_parameters(
+        selected_candidate["parameters"],
+        x_train_full,
+        x_test,
+        y_train_full,
+        y_test,
+        baseline_time=baseline_validation["training_time"],
+        generation=config.generations,
+        random_state=config.random_state,
+    )
+
+    prediction_model = build_model(selected_candidate["parameters"], random_state=config.random_state)
+    prediction_model.fit(features, target)
+
+    return {
+        "dataset_rows": len(dataframe),
+        "dataset_features": features.shape[1],
+        "baseline_validation": baseline_validation,
+        "baseline_test": baseline_test,
+        "optimized_validation": selected_candidate,
+        "optimized_test": optimized_test,
+        "history": pd.DataFrame(history),
+        "pareto_front": pd.DataFrame(front),
+        "all_candidates": pd.DataFrame(all_candidates),
+        "best_parameters": selected_candidate["parameters"],
+        "prediction_model": prediction_model,
+    }
+
+
+def predict_patient(model: Pipeline, patient_values: dict[str, Any]) -> dict[str, Any]:
+    patient_frame = pd.DataFrame([patient_values])
+    prediction = int(model.predict(patient_frame)[0])
+    probability = float(model.predict_proba(patient_frame)[0][1])
+    return {
+        "prediction": prediction,
+        "probability": probability,
+        "label": "Heart Disease Risk Detected" if prediction == 1 else "Lower Heart Disease Risk",
+    }

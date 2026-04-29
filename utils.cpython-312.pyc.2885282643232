@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from sklearn.model_selection import train_test_split
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed.cleveland.data"
+
+DATASET_COLUMNS = [
+    "age",
+    "sex",
+    "cp",
+    "trestbps",
+    "chol",
+    "fbs",
+    "restecg",
+    "thalach",
+    "exang",
+    "oldpeak",
+    "slope",
+    "ca",
+    "thal",
+    "target",
+]
+
+FEATURE_LABELS = {
+    "age": "Age",
+    "sex": "Sex",
+    "cp": "Chest Pain Type",
+    "trestbps": "Resting Blood Pressure",
+    "chol": "Cholesterol",
+    "fbs": "Fasting Blood Sugar",
+    "restecg": "Resting ECG",
+    "thalach": "Max Heart Rate",
+    "exang": "Exercise Angina",
+    "oldpeak": "ST Depression",
+    "slope": "ST Segment Slope",
+    "ca": "Major Vessels",
+    "thal": "Thalassemia",
+    "target": "Heart Disease",
+}
+
+CATEGORICAL_FEATURES = [
+    "sex",
+    "cp",
+    "fbs",
+    "restecg",
+    "exang",
+    "slope",
+    "ca",
+    "thal",
+]
+
+NUMERIC_FEATURES = [
+    "age",
+    "trestbps",
+    "chol",
+    "thalach",
+    "oldpeak",
+]
+
+PLOT_THEME = {
+    "background": "rgba(8, 16, 24, 0)",
+    "paper": "rgba(8, 16, 24, 0)",
+    "grid": "rgba(162, 196, 201, 0.18)",
+    "text": "#EDF2F4",
+    "muted": "#A7BCC2",
+    "accent": "#53D3A6",
+    "warm": "#F2B35B",
+    "alert": "#FF7A59",
+    "line": "#8BD3E6",
+}
+
+
+def load_heart_disease_dataset(data_path: str | Path = DEFAULT_DATA_PATH) -> pd.DataFrame:
+    data_path = Path(data_path)
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Dataset file was not found at {data_path}. "
+            "Download the UCI processed Cleveland file before running the project."
+        )
+
+    dataframe = pd.read_csv(data_path, names=DATASET_COLUMNS)
+    dataframe = dataframe.replace("?", np.nan)
+
+    for column in DATASET_COLUMNS:
+        dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
+
+    dataframe["target_raw"] = dataframe["target"].astype(int)
+    dataframe["target"] = (dataframe["target_raw"] > 0).astype(int)
+    return dataframe
+
+
+def split_dataset(
+    dataframe: pd.DataFrame,
+    test_size: float = 0.20,
+    validation_size: float = 0.25,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    features = dataframe.drop(columns=["target", "target_raw"])
+    target = dataframe["target"]
+
+    x_train_full, x_test, y_train_full, y_test = train_test_split(
+        features,
+        target,
+        test_size=test_size,
+        stratify=target,
+        random_state=random_state,
+    )
+
+    x_search_train, x_validation, y_search_train, y_validation = train_test_split(
+        x_train_full,
+        y_train_full,
+        test_size=validation_size,
+        stratify=y_train_full,
+        random_state=random_state,
+    )
+
+    return {
+        "features": features,
+        "target": target,
+        "x_train_full": x_train_full,
+        "x_test": x_test,
+        "y_train_full": y_train_full,
+        "y_test": y_test,
+        "x_search_train": x_search_train,
+        "x_validation": x_validation,
+        "y_search_train": y_search_train,
+        "y_validation": y_validation,
+    }
+
+
+def get_dataset_profile(dataframe: pd.DataFrame) -> dict[str, Any]:
+    missing = dataframe.drop(columns=["target_raw"]).isna().sum().sort_values(ascending=False)
+    class_distribution = dataframe["target"].value_counts().sort_index()
+
+    return {
+        "rows": int(dataframe.shape[0]),
+        "columns": int(dataframe.shape[1] - 1),
+        "feature_count": int(dataframe.shape[1] - 2),
+        "missing_values": {column: int(count) for column, count in missing.items() if count > 0},
+        "positive_cases": int(class_distribution.get(1, 0)),
+        "negative_cases": int(class_distribution.get(0, 0)),
+        "positive_rate": float(class_distribution.get(1, 0) / len(dataframe)),
+    }
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.2f} ms"
+    return f"{seconds:.2f} s"
+
+
+def format_percent(value: float) -> str:
+    return f"{value * 100:.2f}%"
+
+
+def calculate_percentage_change(new_value: float, base_value: float, invert: bool = False) -> float:
+    if base_value == 0:
+        return 0.0
+
+    change = ((new_value - base_value) / base_value) * 100
+    return -change if invert else change
+
+
+def format_hyperparameters(parameters: dict[str, Any]) -> dict[str, str]:
+    formatted: dict[str, str] = {}
+    for key, value in parameters.items():
+        if isinstance(value, float):
+            formatted[key] = f"{value:.5f}" if value < 1 else f"{value:.3f}"
+        else:
+            formatted[key] = str(value)
+    return formatted
+
+
+def _with_alpha(color: str, alpha: float) -> str:
+    if color.startswith("rgba("):
+        parts = [part.strip() for part in color[5:-1].split(",")]
+        if len(parts) >= 3:
+            return f"rgba({parts[0]}, {parts[1]}, {parts[2]}, {alpha})"
+    if color.startswith("rgb("):
+        parts = [part.strip() for part in color[4:-1].split(",")]
+        if len(parts) == 3:
+            return f"rgba({parts[0]}, {parts[1]}, {parts[2]}, {alpha})"
+    return f"rgba(83, 211, 166, {alpha})"
+
+
+def _base_layout(figure: go.Figure, title: str, y_axis_title: str) -> go.Figure:
+    figure.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor=PLOT_THEME["paper"],
+        plot_bgcolor=PLOT_THEME["background"],
+        font={"family": "Trebuchet MS, Verdana, sans-serif", "color": PLOT_THEME["text"]},
+        title_font={"family": "Georgia, Cambria, serif", "size": 22},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        hoverlabel={"bgcolor": "#13232F", "font_color": PLOT_THEME["text"]},
+        xaxis={
+            "title": "Generation",
+            "gridcolor": PLOT_THEME["grid"],
+            "zerolinecolor": PLOT_THEME["grid"],
+        },
+        yaxis={
+            "title": y_axis_title,
+            "gridcolor": PLOT_THEME["grid"],
+            "zerolinecolor": PLOT_THEME["grid"],
+        },
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+        },
+    )
+    return figure
+
+
+def create_generation_figure(
+    history_frame: pd.DataFrame,
+    metric_column: str,
+    title: str,
+    y_axis_title: str,
+    color: str,
+    percentage_axis: bool = False,
+) -> go.Figure:
+    y_values = history_frame[metric_column] * 100 if percentage_axis else history_frame[metric_column]
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=history_frame["generation"],
+            y=y_values,
+            mode="lines+markers",
+            name=title,
+            line={"color": color, "width": 3},
+            marker={"size": 7, "color": color, "line": {"width": 1, "color": "#0C151C"}},
+            fill="tozeroy",
+            fillcolor=_with_alpha(color, 0.14),
+        )
+    )
+    return _base_layout(figure, title, y_axis_title)
+
+
+def create_pareto_figure(
+    all_candidates: pd.DataFrame,
+    pareto_candidates: pd.DataFrame,
+    default_metrics: dict[str, Any],
+    optimized_metrics: dict[str, Any],
+) -> go.Figure:
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=all_candidates["training_time"] * 1000,
+            y=all_candidates["validation_accuracy"] * 100,
+            mode="markers",
+            name="Explored Candidates",
+            marker={
+                "size": 10,
+                "color": all_candidates["composite_fitness"],
+                "colorscale": [
+                    [0.0, "#214E62"],
+                    [0.5, "#4FB0C6"],
+                    [1.0, "#53D3A6"],
+                ],
+                "opacity": 0.45,
+                "line": {"width": 0},
+                "colorbar": {
+                    "title": {"text": "Fitness", "font": {"color": PLOT_THEME["text"]}},
+                    "tickfont": {"color": PLOT_THEME["text"]},
+                },
+            },
+            customdata=np.stack(
+                [
+                    all_candidates["generation"].astype(str),
+                    all_candidates["composite_fitness"].round(4).astype(str),
+                    all_candidates["model_label"].astype(str),
+                ],
+                axis=1,
+            ),
+            hovertemplate=(
+                "<b>Candidate</b><br>"
+                "Generation: %{customdata[0]}<br>"
+                "Validation Accuracy: %{y:.2f}%<br>"
+                "Training Time: %{x:.2f} ms<br>"
+                "Composite Fitness: %{customdata[1]}<br>"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    sorted_pareto = pareto_candidates.sort_values("training_time")
+    figure.add_trace(
+        go.Scatter(
+            x=sorted_pareto["training_time"] * 1000,
+            y=sorted_pareto["validation_accuracy"] * 100,
+            mode="lines+markers",
+            name="Pareto Front",
+            line={"color": PLOT_THEME["warm"], "width": 4},
+            marker={"size": 11, "color": PLOT_THEME["warm"], "symbol": "diamond"},
+            hovertemplate=(
+                "<b>Pareto Candidate</b><br>"
+                "Validation Accuracy: %{y:.2f}%<br>"
+                "Training Time: %{x:.2f} ms<br>"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=[default_metrics["validation_training_time"] * 1000],
+            y=[default_metrics["validation_accuracy"] * 100],
+            mode="markers+text",
+            name="Default Model",
+            text=["Default"],
+            textposition="top center",
+            marker={"size": 16, "color": PLOT_THEME["alert"], "symbol": "x"},
+        )
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=[optimized_metrics["validation_training_time"] * 1000],
+            y=[optimized_metrics["validation_accuracy"] * 100],
+            mode="markers+text",
+            name="Selected GA Model",
+            text=["GA Selected"],
+            textposition="bottom center",
+            marker={"size": 17, "color": PLOT_THEME["accent"], "symbol": "star"},
+        )
+    )
+
+    figure.update_layout(
+        title="Pareto Front: Accuracy vs. Training Time",
+        template="plotly_dark",
+        paper_bgcolor=PLOT_THEME["paper"],
+        plot_bgcolor=PLOT_THEME["background"],
+        font={"family": "Trebuchet MS, Verdana, sans-serif", "color": PLOT_THEME["text"]},
+        title_font={"family": "Georgia, Cambria, serif", "size": 22},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        hoverlabel={"bgcolor": "#13232F", "font_color": PLOT_THEME["text"]},
+        xaxis={
+            "title": "Training Time (ms)",
+            "gridcolor": PLOT_THEME["grid"],
+            "zerolinecolor": PLOT_THEME["grid"],
+        },
+        yaxis={
+            "title": "Validation Accuracy (%)",
+            "gridcolor": PLOT_THEME["grid"],
+            "zerolinecolor": PLOT_THEME["grid"],
+        },
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+        },
+    )
+    return figure
+
+
+def build_summary_table(default_metrics: dict[str, Any], optimized_metrics: dict[str, Any]) -> pd.DataFrame:
+    rows = [
+        {
+            "Metric": "Validation Accuracy",
+            "Default": format_percent(default_metrics["validation_accuracy"]),
+            "GA Optimized": format_percent(optimized_metrics["validation_accuracy"]),
+        },
+        {
+            "Metric": "Validation Training Time",
+            "Default": format_seconds(default_metrics["validation_training_time"]),
+            "GA Optimized": format_seconds(optimized_metrics["validation_training_time"]),
+        },
+        {
+            "Metric": "Test Accuracy",
+            "Default": format_percent(default_metrics["test_accuracy"]),
+            "GA Optimized": format_percent(optimized_metrics["test_accuracy"]),
+        },
+        {
+            "Metric": "Test Training Time",
+            "Default": format_seconds(default_metrics["test_training_time"]),
+            "GA Optimized": format_seconds(optimized_metrics["test_training_time"]),
+        },
+        {
+            "Metric": "Composite Fitness",
+            "Default": f"{default_metrics['fitness']:.4f}",
+            "GA Optimized": f"{optimized_metrics['fitness']:.4f}",
+        },
+    ]
+    return pd.DataFrame(rows)

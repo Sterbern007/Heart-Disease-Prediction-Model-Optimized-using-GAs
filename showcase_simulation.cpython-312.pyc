@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from showcase_simulation import ShowcaseConfig, predict_patient, run_showcase_simulation
+from utils import format_percent, format_seconds, load_heart_disease_dataset
+
+
+st.set_page_config(
+    page_title="GA Heart Disease Showcase",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+.stApp {
+  background:
+    radial-gradient(circle at 15% 50%, rgba(64, 181, 135, 0.15), transparent 45%),
+    radial-gradient(circle at 85% 30%, rgba(242, 179, 91, 0.12), transparent 40%),
+    linear-gradient(135deg, #07131a 0%, #0d2229 50%, #112c30 100%);
+  color: #edf2f4;
+  background-attachment: fixed;
+}
+[data-testid="stSidebar"] {
+  background: rgba(7, 19, 26, 0.65);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid rgba(124, 181, 199, 0.15);
+}
+.block-container { padding-top: 2rem; padding-bottom: 3rem; }
+.hero, .card, .metric-card {
+  background: rgba(16, 31, 40, 0.5);
+  border: 1px solid rgba(124, 181, 199, 0.15);
+  border-radius: 28px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.4s ease, border-color 0.4s ease;
+}
+.hero { 
+  padding: 3rem; 
+  background: linear-gradient(135deg, rgba(22, 43, 54, 0.6) 0%, rgba(14, 33, 40, 0.4) 100%);
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: "";
+  position: absolute;
+  top: -50%; left: -50%; width: 200%; height: 200%;
+  background: radial-gradient(circle at center, rgba(64, 181, 135, 0.1) 0%, transparent 50%);
+  animation: rotate 25s linear infinite;
+  pointer-events: none;
+}
+@keyframes rotate {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.hero:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 30px 60px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  border-color: rgba(124, 181, 199, 0.3);
+}
+.card:hover, .metric-card:hover {
+  transform: translateY(-6px) scale(1.02);
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  border-color: rgba(124, 181, 199, 0.3);
+}
+.hero h1 {
+  font-family: 'Outfit', sans-serif;
+  font-weight: 700;
+  font-size: clamp(2.2rem, 4.5vw, 4rem);
+  line-height: 1.1;
+  margin: 0.5rem 0 1rem 0;
+  background: linear-gradient(to right, #ffffff, #a7bcc2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.eyebrow {
+  color: #f2b35b;
+  letter-spacing: 0.2rem;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 0.85rem;
+  font-family: 'Outfit', sans-serif;
+  text-shadow: 0 0 15px rgba(242, 179, 91, 0.4);
+}
+.muted { color: #a7bcc2; line-height: 1.7; font-size: 1.05rem; }
+.card { padding: 1.5rem; min-height: 150px; }
+.card h3 {
+  font-family: 'Outfit', sans-serif;
+  font-weight: 600;
+  font-size: 1.25rem;
+  margin: 0 0 0.5rem 0;
+}
+.metric-card { padding: 1.5rem; }
+.metric-card .label {
+  color: #a7bcc2;
+  text-transform: uppercase;
+  letter-spacing: 0.1rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-family: 'Outfit', sans-serif;
+}
+.metric-card .value {
+  margin-top: 0.5rem;
+  font-size: 2.5rem;
+  font-weight: 700;
+  font-family: 'Outfit', sans-serif;
+  text-shadow: 0 0 25px rgba(255,255,255,0.1);
+}
+.green { color: #53d3a6; text-shadow: 0 0 20px rgba(83, 211, 166, 0.4); }
+.orange { color: #f2b35b; text-shadow: 0 0 20px rgba(242, 179, 91, 0.4); }
+.blue { color: #8bd3e6; text-shadow: 0 0 20px rgba(139, 211, 230, 0.4); }
+.red { color: #ff7a59; text-shadow: 0 0 20px rgba(255, 122, 89, 0.4); }
+.section-title {
+  font-family: 'Outfit', sans-serif;
+  font-weight: 600;
+  font-size: 1.6rem;
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  background: linear-gradient(to right, #ffffff, #a7bcc2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+</style>
+"""
+
+
+def metric_card(label: str, value: str, note: str, color_class: str) -> None:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+          <div class="label">{label}</div>
+          <div class="value {color_class}">{value}</div>
+          <div class="muted">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def info_card(title: str, body: str) -> None:
+    st.markdown(
+        f"""
+        <div class="card">
+          <h3>{title}</h3>
+          <div class="muted">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def line_chart(history: pd.DataFrame, column: str, title: str, y_label: str, color: str, percent: bool = False):
+    y_values = history[column] * 100 if percent else history[column]
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=history["generation"],
+            y=y_values,
+            mode="lines+markers",
+            line={"color": color, "width": 3},
+            marker={"size": 8, "color": color},
+            fill="tozeroy",
+            fillcolor="rgba(83, 211, 166, 0.10)",
+        )
+    )
+    figure.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#edf2f4"},
+        xaxis_title="Generation",
+        yaxis_title=y_label,
+        margin={"l": 20, "r": 20, "t": 55, "b": 20},
+    )
+    return figure
+
+
+def pareto_chart(candidates: pd.DataFrame, front: pd.DataFrame):
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=candidates["training_time"] * 1000,
+            y=candidates["accuracy"] * 100,
+            mode="markers",
+            name="GA candidates",
+            marker={
+                "size": 10,
+                "color": candidates["fitness"],
+                "colorscale": "Tealgrn",
+                "opacity": 0.55,
+                "showscale": True,
+            },
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=front["training_time"] * 1000,
+            y=front["accuracy"] * 100,
+            mode="lines+markers",
+            name="Pareto front",
+            line={"color": "#f2b35b", "width": 4},
+            marker={"size": 12, "symbol": "diamond", "color": "#f2b35b"},
+        )
+    )
+    figure.update_layout(
+        title="Pareto Front: Accuracy vs Training Time",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#edf2f4"},
+        xaxis_title="Training Time (ms)",
+        yaxis_title="Validation Accuracy (%)",
+        margin={"l": 20, "r": 20, "t": 55, "b": 20},
+    )
+    return figure
+
+
+def get_option_index(options: dict[str, int], value: int) -> int:
+    return list(options.values()).index(value)
+
+
+st.markdown(CSS, unsafe_allow_html=True)
+
+if "showcase_result" not in st.session_state:
+    st.session_state["showcase_result"] = None
+if "showcase_prediction" not in st.session_state:
+    st.session_state["showcase_prediction"] = None
+
+dataset = load_heart_disease_dataset()
+defaults = {
+    "age": int(round(dataset["age"].median())),
+    "sex": int(dataset["sex"].mode(dropna=True).iat[0]),
+    "cp": int(dataset["cp"].mode(dropna=True).iat[0]),
+    "trestbps": int(round(dataset["trestbps"].median())),
+    "chol": int(round(dataset["chol"].median())),
+    "fbs": int(dataset["fbs"].mode(dropna=True).iat[0]),
+    "restecg": int(dataset["restecg"].mode(dropna=True).iat[0]),
+    "thalach": int(round(dataset["thalach"].median())),
+    "exang": int(dataset["exang"].mode(dropna=True).iat[0]),
+    "oldpeak": float(round(dataset["oldpeak"].median(), 1)),
+    "slope": int(dataset["slope"].mode(dropna=True).iat[0]),
+    "ca": int(dataset["ca"].dropna().mode().iat[0]),
+    "thal": int(dataset["thal"].dropna().mode().iat[0]),
+}
+
+sex_options = {"Female": 0, "Male": 1}
+cp_options = {"Typical angina": 1, "Atypical angina": 2, "Non-anginal pain": 3, "Asymptomatic": 4}
+fbs_options = {"<= 120 mg/dl": 0, "> 120 mg/dl": 1}
+restecg_options = {"Normal": 0, "ST-T abnormality": 1, "LV hypertrophy": 2}
+exang_options = {"No": 0, "Yes": 1}
+slope_options = {"Upsloping": 1, "Flat": 2, "Downsloping": 3}
+ca_options = {"0": 0, "1": 1, "2": 2, "3": 3}
+thal_options = {"Normal": 3, "Fixed defect": 6, "Reversible defect": 7}
+
+with st.sidebar:
+    st.markdown("## Simulation Controls")
+    st.caption("Keep these values small for a fast classroom demo.")
+    population_size = st.slider("Population size", 8, 30, 14, 2)
+    generations = st.slider("Generations", 4, 20, 8, 1)
+    mutation_rate = st.slider("Mutation rate", 0.05, 0.45, 0.18, 0.01)
+    run_button = st.button("Run GA Simulation", type="primary", use_container_width=True)
+    st.markdown("---")
+    st.write("Teacher expectation:")
+    st.write("Use ML prediction plus GA optimization to maximize accuracy and minimize training time.")
+
+st.markdown(
+    """
+    <div class="hero">
+      <div class="eyebrow">Simple Viva Showcase</div>
+      <h1>Genetic Algorithm for Multi-Objective Optimization of Heart Disease Prediction</h1>
+      <div class="muted">
+        This simulation uses the UCI Heart Disease dataset and a Random Forest model. The Genetic Algorithm
+        searches for model settings that give a good trade-off between high prediction accuracy and low training time.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="section-title">What This Project Demonstrates</div>', unsafe_allow_html=True)
+explain_cols = st.columns(4)
+with explain_cols[0]:
+    info_card("Problem", "Predict whether heart disease is present using patient clinical attributes.")
+with explain_cols[1]:
+    info_card("Objective 1", "Maximize model accuracy so predictions are more reliable.")
+with explain_cols[2]:
+    info_card("Objective 2", "Minimize training time so the model is faster and more efficient.")
+with explain_cols[3]:
+    info_card("GA Role", "Try different Random Forest settings across generations and keep better solutions.")
+
+if run_button:
+    st.session_state["showcase_prediction"] = None
+    progress = st.progress(0, text="Starting GA simulation...")
+    status = st.empty()
+
+    def progress_callback(payload: dict) -> None:
+        progress.progress(
+            int((payload["generation"] / payload["total_generations"]) * 100),
+            text=(
+                f"Generation {payload['generation']} / {payload['total_generations']} | "
+                f"Accuracy: {payload['accuracy'] * 100:.2f}% | "
+                f"Time: {payload['training_time'] * 1000:.2f} ms"
+            ),
+        )
+        status.info(
+            f"Current best fitness: {payload['fitness']:.4f}. "
+            "Fitness combines accuracy reward and training-time penalty."
+        )
+
+    with st.spinner("Training models and evolving the population..."):
+        st.session_state["showcase_result"] = run_showcase_simulation(
+            ShowcaseConfig(
+                population_size=population_size,
+                generations=generations,
+                mutation_rate=mutation_rate,
+            ),
+            progress_callback=progress_callback,
+        )
+    progress.progress(100, text="GA simulation complete.")
+    status.success("Simulation finished. Review the before/after results below.")
+
+result = st.session_state["showcase_result"]
+
+if not result:
+    st.info("Click `Run GA Simulation` in the sidebar to generate the before/after results and charts.")
+else:
+    baseline = result["baseline_validation"]
+    optimized = result["optimized_validation"]
+    validation = result["optimized_validation"]
+
+    st.markdown('<div class="section-title">Before GA vs After GA</div>', unsafe_allow_html=True)
+    metric_cols = st.columns(4)
+    with metric_cols[0]:
+        metric_card("Default Accuracy", format_percent(baseline["accuracy"]), "Before GA on validation split", "orange")
+    with metric_cols[1]:
+        metric_card("Optimized Accuracy", format_percent(optimized["accuracy"]), "After GA on validation split", "green")
+    with metric_cols[2]:
+        metric_card("Default Time", format_seconds(baseline["training_time"]), "Before GA", "orange")
+    with metric_cols[3]:
+        metric_card("Optimized Time", format_seconds(optimized["training_time"]), "After GA", "blue")
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "Stage": "Before GA",
+                "Accuracy": format_percent(baseline["accuracy"]),
+                "Training Time": format_seconds(baseline["training_time"]),
+                "Fitness": f"{baseline['fitness']:.4f}",
+            },
+            {
+                "Stage": "After GA",
+                "Accuracy": format_percent(optimized["accuracy"]),
+                "Training Time": format_seconds(optimized["training_time"]),
+                "Fitness": f"{optimized['fitness']:.4f}",
+            },
+        ]
+    )
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="section-title">Best GA Solution</div>', unsafe_allow_html=True)
+    solution_cols = st.columns([0.75, 1.25])
+    with solution_cols[0]:
+        metric_card("Selected Fitness", f"{validation['fitness']:.4f}", "Chosen from the Pareto front", "green")
+    with solution_cols[1]:
+        st.json(result["best_parameters"], expanded=True)
+
+    st.markdown('<div class="section-title">Easy-to-Explain Graphs</div>', unsafe_allow_html=True)
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.plotly_chart(
+            line_chart(
+                result["history"],
+                "best_accuracy",
+                "Accuracy Improves Across Generations",
+                "Accuracy (%)",
+                "#53d3a6",
+                percent=True,
+            ),
+            use_container_width=True,
+        )
+    with chart_cols[1]:
+        st.plotly_chart(
+            line_chart(
+                result["history"],
+                "best_training_time",
+                "Training Time Across Generations",
+                "Training Time (seconds)",
+                "#f2b35b",
+            ),
+            use_container_width=True,
+        )
+    st.plotly_chart(pareto_chart(result["all_candidates"], result["pareto_front"]), use_container_width=True)
+
+    st.markdown('<div class="section-title">Patient Prediction Demo</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="muted">After GA finds the optimized model settings, the same optimized model is retrained and used for patient-level prediction. This predicts heart disease presence probability, not a named medical diagnosis.</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("patient_form"):
+        form_cols = st.columns(3)
+        with form_cols[0]:
+            age = st.number_input("Age", 20, 100, defaults["age"])
+            sex = st.selectbox("Sex", list(sex_options.keys()), index=get_option_index(sex_options, defaults["sex"]))
+            cp = st.selectbox("Chest Pain Type", list(cp_options.keys()), index=get_option_index(cp_options, defaults["cp"]))
+            trestbps = st.number_input("Resting BP", 80, 240, defaults["trestbps"])
+        with form_cols[1]:
+            chol = st.number_input("Cholesterol", 100, 700, defaults["chol"])
+            fbs = st.selectbox("Fasting Blood Sugar", list(fbs_options.keys()), index=get_option_index(fbs_options, defaults["fbs"]))
+            restecg = st.selectbox("Resting ECG", list(restecg_options.keys()), index=get_option_index(restecg_options, defaults["restecg"]))
+            thalach = st.number_input("Max Heart Rate", 60, 230, defaults["thalach"])
+        with form_cols[2]:
+            exang = st.selectbox("Exercise Angina", list(exang_options.keys()), index=get_option_index(exang_options, defaults["exang"]))
+            oldpeak = st.number_input("Oldpeak", 0.0, 7.0, defaults["oldpeak"], step=0.1)
+            slope = st.selectbox("Slope", list(slope_options.keys()), index=get_option_index(slope_options, defaults["slope"]))
+            ca = st.selectbox("Major Vessels", list(ca_options.keys()), index=get_option_index(ca_options, defaults["ca"]))
+            thal = st.selectbox("Thalassemia", list(thal_options.keys()), index=get_option_index(thal_options, defaults["thal"]))
+
+        predict_button = st.form_submit_button("Predict With Optimized Model", type="primary", use_container_width=True)
+
+    if predict_button:
+        patient = {
+            "age": int(age),
+            "sex": sex_options[sex],
+            "cp": cp_options[cp],
+            "trestbps": int(trestbps),
+            "chol": int(chol),
+            "fbs": fbs_options[fbs],
+            "restecg": restecg_options[restecg],
+            "thalach": int(thalach),
+            "exang": exang_options[exang],
+            "oldpeak": float(oldpeak),
+            "slope": slope_options[slope],
+            "ca": ca_options[ca],
+            "thal": thal_options[thal],
+        }
+        st.session_state["showcase_prediction"] = predict_patient(result["prediction_model"], patient)
+
+    prediction = st.session_state["showcase_prediction"]
+    if prediction:
+        prediction_cols = st.columns(3)
+        with prediction_cols[0]:
+            metric_card("Prediction", prediction["label"], "Optimized Random Forest output", "red" if prediction["prediction"] else "green")
+        with prediction_cols[1]:
+            metric_card("Disease Probability", format_percent(prediction["probability"]), "Probability for disease present", "orange")
+        with prediction_cols[2]:
+            metric_card("Model Used", "GA Optimized", "Selected by accuracy-time trade-off", "blue")
+        st.progress(
+            int(round(prediction["probability"] * 100)),
+            text=f"Estimated probability: {prediction['probability'] * 100:.2f}%",
+        )

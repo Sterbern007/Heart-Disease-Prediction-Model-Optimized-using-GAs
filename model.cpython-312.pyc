@@ -1,0 +1,193 @@
+# CardioGA Optimizer
+
+`Genetic Algorithm (GA) for Multi-Objective Optimization of Accuracy and Training Time using the UCI Heart Disease Dataset`
+
+This project is a demo-ready machine learning dashboard that tunes a heart disease classifier with a from-scratch genetic algorithm. The goal is not only to find a model that predicts well, but also to find one that trains quickly enough to be practical for iterative experimentation and lightweight deployment.
+
+## Problem Statement
+
+Heart disease prediction is a high-value binary classification task, but model selection often focuses on accuracy alone. In real projects, that is incomplete. A model that is slightly more accurate but much slower to train may be less useful in practice than a model that is almost as accurate and significantly faster.
+
+This project treats model tuning as a **multi-objective optimization problem** with two simultaneous goals:
+
+1. Maximize predictive accuracy
+2. Minimize training time
+
+## Why Multi-Objective Optimization?
+
+When two objectives conflict, there is rarely a single universally best answer. Instead, there is a set of efficient trade-off points.
+
+- A solution **dominates** another solution if it is at least as accurate and no slower, with one strict improvement.
+- The **Pareto front** is the set of non-dominated solutions.
+- Any point on the Pareto front is a valid engineering choice depending on whether you care more about speed or accuracy.
+
+This is why the dashboard does not reduce the whole search to a single score only. It tracks a composite fitness for selection, but it also preserves and visualizes the Pareto frontier.
+
+## How the Genetic Algorithm Works
+
+The GA is implemented from scratch in `ga.py` without DEAP or any other evolutionary optimization library.
+
+Each chromosome encodes a model's hyperparameters. For every generation, the algorithm:
+
+1. Initializes a population of candidate hyperparameter sets
+2. Trains a model for each candidate and measures:
+   - validation accuracy
+   - training time
+3. Computes Pareto dominance and crowding distance
+4. Selects parents using tournament selection
+5. Produces offspring using uniform crossover
+6. Applies controlled mutation to individual genes
+7. Preserves top elite candidates
+8. Stops after the configured generations or earlier if the search stagnates
+
+The selection logic uses the Pareto front first, and the composite fitness acts as a practical tie-breaker for choosing a single dashboard winner from the efficient frontier.
+
+## Dataset
+
+The project uses the **processed Cleveland subset** of the official UCI Heart Disease dataset.
+
+- Source: UCI Heart Disease dataset
+- Rows: 303
+- Features used for modeling: 13
+- Missing values: 6 total (`ca` and `thal`)
+- Target transformation: `target > 0` becomes `1` for disease presence, otherwise `0`
+
+## Data Handling Pipeline
+
+The preprocessing flow is modular and reusable:
+
+- Load the raw CSV-style UCI file from `data/processed.cleveland.data`
+- Replace `?` markers with null values
+- Convert columns to numeric types
+- Separate numeric and categorical features
+- Impute missing values inside the model pipeline
+- One-hot encode categorical features
+- Scale numeric features for logistic regression
+- Create stratified train, validation, and test splits
+
+## Models and Search Spaces
+
+Two model families are supported from the same UI:
+
+### Logistic Regression
+
+Optimized hyperparameters:
+
+- `C`
+- `penalty`
+- `max_iter`
+- `class_weight`
+- `tol`
+
+### Random Forest
+
+Optimized hyperparameters:
+
+- `n_estimators`
+- `max_depth`
+- `min_samples_split`
+- `min_samples_leaf`
+- `max_features`
+- `bootstrap`
+
+## Project Structure
+
+```text
+.
+|-- app.py
+|-- ga.py
+|-- main.py
+|-- model.py
+|-- utils.py
+|-- requirements.txt
+|-- README.md
+|-- data/
+|   `-- processed.cleveland.data
+`-- outputs/
+```
+
+## Running the Project
+
+### Streamlit Dashboard
+
+```bash
+streamlit run app.py
+```
+
+### Simple Showcase Simulation
+
+Use this version for a clean teacher-facing demonstration of the title and rubric without extra complexity:
+
+```bash
+streamlit run showcase_app.py
+```
+
+### CLI Demo Run
+
+```bash
+python main.py --model logistic_regression --population-size 28 --generations 18 --mutation-rate 0.18
+```
+
+On this machine, validation was performed with:
+
+```bash
+C:\Users\LENOVO\anaconda3\python.exe -B main.py --model logistic_regression --population-size 28 --generations 18 --mutation-rate 0.18
+```
+
+## Streamlit UI Highlights
+
+The dashboard is designed as a mini analytical product rather than a basic script runner.
+
+- Sidebar controls for population size, mutation rate, generations, and model family
+- Hero section with a presentation-style overview
+- Tabs for Overview, Results, Graphs, Prediction, and Severity GA
+- A Severity GA tab that implements multi-output Random Forest prediction for UCI severity class and derived risk level
+- Live GA progress updates and spinner feedback during optimization
+- Color-coded metric cards for accuracy, time, and fitness
+- Interactive Plotly charts for:
+  - accuracy vs. generations
+  - training time vs. generations
+  - composite fitness vs. generations
+  - Pareto front visualization
+- Clean presentation of the best hyperparameters and top Pareto candidates
+- A patient-detail form that uses the selected model to estimate heart disease presence probability
+- A second patient-detail form that uses GA-selected features to predict both severity class and risk level
+
+## Example Output
+
+Sample CLI run for the Logistic Regression configuration saved under `outputs/logistic`:
+
+```text
+========================================================================
+CardioGA Optimization Report
+========================================================================
+Model Family          : Logistic Regression
+Completed Generations : 14
+Stopped Early         : True
+
+Default vs Optimized
+  Validation Accuracy : 85.25% -> 88.52%
+  Validation Time     : 10.63 ms -> 10.45 ms
+  Test Accuracy       : 88.52% -> 88.52%
+  Test Time           : 12.21 ms -> 11.70 ms
+  Composite Fitness   : 0.7927 -> 0.8166
+```
+
+## What the Result Means
+
+In the sample run, the GA found a Logistic Regression configuration that:
+
+- Increased validation accuracy from `85.25%` to `88.52%`
+- Slightly reduced validation training time from `10.63 ms` to `10.45 ms`
+- Preserved held-out test accuracy at `88.52%`
+- Slightly reduced held-out test training time from `12.21 ms` to `11.70 ms`
+
+That is a solid multi-objective outcome: the GA found a configuration that improved validation accuracy, preserved final test accuracy, and held training time essentially flat with a slight speed gain.
+
+## Notes for Viva / Presentation
+
+- The GA is not a black box because every step of selection, crossover, mutation, elitism, and Pareto ranking is written explicitly in code.
+- The held-out test split is kept separate from the GA search loop, which makes the final comparison more defensible.
+- The dashboard explains dominance, Pareto efficiency, and the rationale behind the selected solution directly inside the UI.
+- Result files are exported to `outputs/latest_results.json`, `outputs/generation_history.csv`, and `outputs/pareto_front.csv`.
+- Because training time is measured live on the local machine, the exact speed-focused Pareto winner can shift slightly if the system is under different background load.

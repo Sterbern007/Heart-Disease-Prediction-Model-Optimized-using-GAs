@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.preprocessing import StandardScaler
+
+from utils import CATEGORICAL_FEATURES, DEFAULT_DATA_PATH, load_heart_disease_dataset
+
+
+RISK_LABELS = {
+    0: "Low Risk",
+    1: "Moderate Risk",
+    2: "High Risk",
+}
+
+SEVERITY_LABELS = {
+    0: "No heart disease detected",
+    1: "Mild severity",
+    2: "Moderate severity",
+    3: "High severity",
+    4: "Very high severity",
+}
+
+
+@dataclass
+class MultiOutputGAConfig:
+    population_size: int = 20
+    generations: int = 20
+    mutation_rate: float = 0.20
+    random_state: int = 42
+    time_penalty: float = 0.01
+
+
+def _build_multioutput_dataset(data_path=DEFAULT_DATA_PATH) -> dict[str, Any]:
+    dataframe = load_heart_disease_dataset(data_path)
+    dataframe = dataframe.drop(columns=["target"]).dropna().copy()
+    dataframe["risk_level"] = dataframe["target_raw"].apply(
+        lambda value: 0 if value == 0 else (1 if value <= 2 else 2)
+    )
+    dataframe = dataframe.rename(columns={"target_raw": "num"})
+
+    features = dataframe.drop(columns=["num", "risk_level"])
+    features = pd.get_dummies(features, columns=CATEGORICAL_FEATURES, drop_first=True)
+    targets = dataframe[["num", "risk_level"]]
+
+    return {
+        "features": features,
+        "targets": targets,
+        "raw_frame": dataframe,
+        "feature_columns": list(features.columns),
+    }
+
+
+def _make_model(random_state: int, n_estimators: int = 150, max_depth: int = 10) -> MultiOutputClassifier:
+    return MultiOutputClassifier(
+        RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=1,
+        )
+    )
+
+
+def _score_model(model, x_train, y_train, x_eval, y_eval) -> dict[str, float]:
+    start_time = time.perf_counter()
+    model.fit(x_train, y_train)
+    training_time = time.perf_counter() - start_time
+
+    predictions = model.predict(x_eval)
+    severity_accuracy = accuracy_score(y_eval["num"], predictions[:, 0])
+    risk_accuracy = accuracy_score(y_eval["risk_level"], predictions[:, 1])
+    exact_match_accuracy = np.mean(np.all(y_eval.to_numpy() == predictions, axis=1))
+
+    return {
+        "severity_accuracy": float(severity_accuracy),
+        "risk_accuracy": float(risk_accuracy),
+        "exact_match_accuracy": float(exact_match_accuracy),
+        "training_time": float(training_time),
+    }
+
+
+def _fitness_from_metrics(metrics: dict[str, float], time_penalty: float) -> float:
+    mean_accuracy = (metrics["severity_accuracy"] + metrics["risk_accuracy"]) / 2
+    return float(mean_accuracy - (time_penalty * metrics["training_time"]))
+
+
+def _evaluate_chromosome(
+    chromosome: np.ndarray,
+    x_train: np.ndarray,
+    y_train: pd.DataFrame,
+    x_validation: np.ndarray,
+    y_validation: pd.DataFrame,
+    random_state: int,
+    time_penalty: float,
+) -> dict[str, Any]:
+    selected_indices = np.flatnonzero(chromosome == 1)
+    if len(selected_indices) == 0:
+        return {
+            "fitness": -1.0,
+            "severity_accuracy": 0.0,
+            "risk_accuracy": 0.0,
+            "exact_match_accuracy": 0.0,
+            "training_time": 0.0,
+            "selected_indices": selected_indices,
+        }
+
+    model = _make_model(random_state=random_state, n_estimators=150, max_depth=10)
+    metrics = _score_model(
+        model,
+        x_train[:, selected_indices],
+        y_train,
+        x_validation[:, selected_indices],
+        y_validation,
+    )
+
+    return {
+        **metrics,
+        "fitness": _fitness_from_metrics(metrics, time_penalty=time_penalty),
+        "selected_indices": selected_indices,
+    }
+
+
+def _initialize_population(population_size: int, feature_count: int, rng) -> np.ndarray:
+    population = rng.integers(0, 2, size=(population_size, feature_count), dtype=int)
+    empty_rows = np.where(population.sum(axis=1) == 0)[0]
+    for row in empty_rows:
+        population[row, rng.integers(0, feature_count)] = 1
+    return population
+
+
+def _breed_next_population(
+    population: np.ndarray,
+    scores: np.ndarray,
+    mutation_rate: float,
+    rng,
+) -> np.ndarray:
+    population_size, feature_count = population.shape
+    elite_count = max(2, population_size // 5)
+    selected_count = max(2, population_size // 2)
+
+    ranked_indices = np.argsort(scores)[::-1]
+    elites = population[ranked_indices[:elite_count]].copy()
+    parents = population[ranked_indices[:selected_count]]
+
+    next_population = [candidate.copy() for candidate in elites]
+    while len(next_population) < population_size:
+        parent_indices = rng.choice(len(parents), size=2, replace=True)
+        parent_a = parents[parent_indices[0]]
+        parent_b = parents[parent_indices[1]]
+        crossover_point = int(rng.integers(1, feature_count))
+        child = np.concatenate([parent_a[:crossover_point], parent_b[crossover_point:]])
+
+        mutation_mask = rng.random(feature_count) < mutation_rate
+        child[mutation_mask] = 1 - child[mutation_mask]
+        if child.sum() == 0:
+            child[rng.integers(0, feature_count)] = 1
+
+        next_population.append(child)
+
+    return np.array(next_population[:population_size], dtype=int)
+
+
+def run_multioutput_feature_ga(
+    config: MultiOutputGAConfig,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    rng = np.random.default_rng(config.random_state)
+    prepared = _build_multioutput_dataset()
+    features = prepared["features"]
+    targets = prepared["targets"]
+
+    x_train_full, x_test, y_train_full, y_test = train_test_split(
+        features,
+        targets,
+        test_size=0.20,
+        random_state=config.random_state,
+        stratify=targets["risk_level"],
+    )
+    x_train, x_validation, y_train, y_validation = train_test_split(
+        x_train_full,
+        y_train_full,
+        test_size=0.20,
+        random_state=config.random_state,
+        stratify=y_train_full["risk_level"],
+    )
+
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_validation_scaled = scaler.transform(x_validation)
+
+    full_scaler = StandardScaler()
+    x_train_full_scaled = full_scaler.fit_transform(x_train_full)
+    x_test_scaled = full_scaler.transform(x_test)
+
+    baseline_model = _make_model(random_state=config.random_state, n_estimators=150, max_depth=10)
+    baseline_metrics = _score_model(
+        baseline_model,
+        x_train_full_scaled,
+        y_train_full,
+        x_test_scaled,
+        y_test,
+    )
+
+    feature_count = x_train_scaled.shape[1]
+    population = _initialize_population(config.population_size, feature_count, rng)
+    history: list[dict[str, Any]] = []
+    best_chromosome = population[0]
+    best_evaluation: dict[str, Any] | None = None
+
+    for generation in range(1, config.generations + 1):
+        evaluations = [
+            _evaluate_chromosome(
+                chromosome,
+                x_train_scaled,
+                y_train,
+                x_validation_scaled,
+                y_validation,
+                random_state=config.random_state,
+                time_penalty=config.time_penalty,
+            )
+            for chromosome in population
+        ]
+        scores = np.array([evaluation["fitness"] for evaluation in evaluations])
+        best_index = int(np.argmax(scores))
+        generation_best = evaluations[best_index]
+
+        if best_evaluation is None or generation_best["fitness"] > best_evaluation["fitness"]:
+            best_chromosome = population[best_index].copy()
+            best_evaluation = generation_best
+
+        history.append(
+            {
+                "generation": generation,
+                "best_fitness": float(generation_best["fitness"]),
+                "best_severity_accuracy": float(generation_best["severity_accuracy"]),
+                "best_risk_accuracy": float(generation_best["risk_accuracy"]),
+                "best_training_time": float(generation_best["training_time"]),
+                "selected_features": int(len(generation_best["selected_indices"])),
+            }
+        )
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "generation": generation,
+                    "total_generations": config.generations,
+                    "best_fitness": float(generation_best["fitness"]),
+                    "severity_accuracy": float(generation_best["severity_accuracy"]),
+                    "risk_accuracy": float(generation_best["risk_accuracy"]),
+                    "selected_features": int(len(generation_best["selected_indices"])),
+                }
+            )
+
+        population = _breed_next_population(population, scores, config.mutation_rate, rng)
+
+    selected_indices = np.flatnonzero(best_chromosome == 1)
+    final_model = _make_model(random_state=config.random_state, n_estimators=200, max_depth=12)
+    final_metrics = _score_model(
+        final_model,
+        x_train_full_scaled[:, selected_indices],
+        y_train_full,
+        x_test_scaled[:, selected_indices],
+        y_test,
+    )
+
+    selected_feature_names = [prepared["feature_columns"][index] for index in selected_indices]
+    prediction_bundle = {
+        "model": final_model,
+        "scaler": full_scaler,
+        "feature_columns": prepared["feature_columns"],
+        "selected_indices": selected_indices,
+        "selected_feature_names": selected_feature_names,
+    }
+
+    return {
+        "baseline_metrics": baseline_metrics,
+        "optimized_metrics": final_metrics,
+        "history": pd.DataFrame(history),
+        "selected_feature_names": selected_feature_names,
+        "selected_feature_count": len(selected_feature_names),
+        "total_feature_count": feature_count,
+        "prediction_bundle": prediction_bundle,
+    }
+
+
+def predict_multioutput_patient(prediction_bundle: dict[str, Any], patient_values: dict[str, Any]) -> dict[str, Any]:
+    patient_frame = pd.DataFrame([patient_values])
+    encoded = pd.get_dummies(patient_frame, columns=CATEGORICAL_FEATURES, drop_first=True)
+    encoded = encoded.reindex(columns=prediction_bundle["feature_columns"], fill_value=0)
+    scaled = prediction_bundle["scaler"].transform(encoded)
+    selected = scaled[:, prediction_bundle["selected_indices"]]
+
+    prediction = prediction_bundle["model"].predict(selected)[0]
+    probabilities = prediction_bundle["model"].predict_proba(selected)
+    severity_class = int(prediction[0])
+    risk_level = int(prediction[1])
+
+    severity_classes = list(prediction_bundle["model"].estimators_[0].classes_)
+    risk_classes = list(prediction_bundle["model"].estimators_[1].classes_)
+    severity_probability = float(probabilities[0][0][severity_classes.index(severity_class)])
+    risk_probability = float(probabilities[1][0][risk_classes.index(risk_level)])
+
+    return {
+        "severity_class": severity_class,
+        "severity_label": SEVERITY_LABELS.get(severity_class, f"Severity class {severity_class}"),
+        "risk_level": risk_level,
+        "risk_label": RISK_LABELS.get(risk_level, f"Risk level {risk_level}"),
+        "severity_probability": severity_probability,
+        "risk_probability": risk_probability,
+    }

@@ -1,0 +1,327 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import pandas as pd
+
+from ga import GeneticOptimizer, evaluate_hyperparameters, evaluate_test_performance
+from model import build_pipeline, get_default_hyperparameters, get_model_label
+from utils import (
+    DEFAULT_DATA_PATH,
+    build_summary_table,
+    calculate_percentage_change,
+    format_hyperparameters,
+    format_percent,
+    format_seconds,
+    get_dataset_profile,
+    load_heart_disease_dataset,
+    split_dataset,
+)
+
+
+@dataclass
+class ExperimentConfig:
+    model_name: str = "logistic_regression"
+    population_size: int = 28
+    generations: int = 18
+    mutation_rate: float = 0.18
+    crossover_rate: float = 0.85
+    elitism_fraction: float = 0.15
+    stagnation_patience: int = 6
+    random_state: int = 42
+    data_path: Path = DEFAULT_DATA_PATH
+    test_size: float = 0.20
+    validation_size: float = 0.25
+
+
+def _candidate_to_metrics(candidate, test_metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "validation_accuracy": candidate.validation_accuracy,
+        "validation_training_time": candidate.training_time,
+        "time_score": candidate.time_score,
+        "fitness": candidate.composite_fitness,
+        "test_accuracy": test_metrics["test_accuracy"],
+        "test_training_time": test_metrics["test_training_time"],
+        "test_time_score": test_metrics["test_time_score"],
+        "test_fitness": test_metrics["test_fitness"],
+        "hyperparameters": dict(candidate.hyperparameters),
+    }
+
+
+def _serialise_for_json(result: dict[str, Any]) -> dict[str, Any]:
+    serialised = dict(result)
+    serialised.pop("prediction_pipeline", None)
+    serialised.pop("default_prediction_pipeline", None)
+    serialised["history"] = result["history"].to_dict(orient="records")
+    serialised["pareto_front"] = result["pareto_front"].to_dict(orient="records")
+    serialised["all_candidates"] = result["all_candidates"].to_dict(orient="records")
+    serialised["dataset_preview"] = result["dataset_preview"].to_dict(orient="records")
+    serialised["comparison_table"] = result["comparison_table"].to_dict(orient="records")
+    serialised["config"] = {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in asdict(result["config"]).items()
+    }
+    return serialised
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if pd.isna(value):
+        return None
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def train_prediction_pipeline(
+    model_name: str,
+    hyperparameters: dict[str, Any],
+    data_path: str | Path = DEFAULT_DATA_PATH,
+    random_state: int = 42,
+):
+    dataframe = load_heart_disease_dataset(data_path)
+    features = dataframe.drop(columns=["target", "target_raw"])
+    target = dataframe["target"]
+    pipeline = build_pipeline(model_name, hyperparameters, random_state=random_state)
+    pipeline.fit(features, target)
+    return pipeline
+
+
+def run_experiment(
+    config: ExperimentConfig,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    dataframe = load_heart_disease_dataset(config.data_path)
+    dataset_profile = get_dataset_profile(dataframe)
+    split = split_dataset(
+        dataframe,
+        test_size=config.test_size,
+        validation_size=config.validation_size,
+        random_state=config.random_state,
+    )
+
+    default_hyperparameters = get_default_hyperparameters(config.model_name)
+    default_probe_candidate = evaluate_hyperparameters(
+        model_name=config.model_name,
+        hyperparameters=default_hyperparameters,
+        x_train=split["x_search_train"],
+        x_validation=split["x_validation"],
+        y_train=split["y_search_train"],
+        y_validation=split["y_validation"],
+        baseline_training_time=1.0,
+        generation=0,
+        source="default-probe",
+        random_state=config.random_state,
+    )
+
+    default_validation_candidate = evaluate_hyperparameters(
+        model_name=config.model_name,
+        hyperparameters=default_hyperparameters,
+        x_train=split["x_search_train"],
+        x_validation=split["x_validation"],
+        y_train=split["y_search_train"],
+        y_validation=split["y_validation"],
+        baseline_training_time=default_probe_candidate.training_time,
+        generation=0,
+        source="default",
+        random_state=config.random_state,
+    )
+
+    optimizer = GeneticOptimizer(
+        model_name=config.model_name,
+        x_train=split["x_search_train"],
+        x_validation=split["x_validation"],
+        y_train=split["y_search_train"],
+        y_validation=split["y_validation"],
+        population_size=config.population_size,
+        generations=config.generations,
+        mutation_rate=config.mutation_rate,
+        crossover_rate=config.crossover_rate,
+        elitism_fraction=config.elitism_fraction,
+        stagnation_patience=config.stagnation_patience,
+        baseline_training_time=default_validation_candidate.training_time,
+        random_state=config.random_state,
+    )
+
+    optimization_result = optimizer.run(progress_callback=progress_callback)
+
+    default_test_metrics = evaluate_test_performance(
+        model_name=config.model_name,
+        hyperparameters=default_hyperparameters,
+        x_train=split["x_train_full"],
+        x_test=split["x_test"],
+        y_train=split["y_train_full"],
+        y_test=split["y_test"],
+        baseline_training_time=default_validation_candidate.training_time,
+        random_state=config.random_state,
+    )
+
+    optimized_test_metrics = evaluate_test_performance(
+        model_name=config.model_name,
+        hyperparameters=optimization_result.selected_candidate.hyperparameters,
+        x_train=split["x_train_full"],
+        x_test=split["x_test"],
+        y_train=split["y_train_full"],
+        y_test=split["y_test"],
+        baseline_training_time=default_validation_candidate.training_time,
+        random_state=config.random_state,
+    )
+
+    default_metrics = _candidate_to_metrics(default_validation_candidate, default_test_metrics)
+    optimized_metrics = _candidate_to_metrics(optimization_result.selected_candidate, optimized_test_metrics)
+
+    history_frame = pd.DataFrame(optimization_result.history)
+    pareto_frame = pd.DataFrame(
+        [candidate.to_record(config.model_name) for candidate in optimization_result.pareto_front]
+    )
+    all_candidates_frame = pd.DataFrame(
+        [candidate.to_record(config.model_name) for candidate in optimization_result.all_candidates]
+    )
+    comparison_table = build_summary_table(default_metrics, optimized_metrics)
+    default_prediction_pipeline = train_prediction_pipeline(
+        model_name=config.model_name,
+        hyperparameters=default_hyperparameters,
+        data_path=config.data_path,
+        random_state=config.random_state,
+    )
+    optimized_prediction_pipeline = train_prediction_pipeline(
+        model_name=config.model_name,
+        hyperparameters=optimization_result.selected_candidate.hyperparameters,
+        data_path=config.data_path,
+        random_state=config.random_state,
+    )
+
+    result = {
+        "config": config,
+        "model_name": config.model_name,
+        "model_label": get_model_label(config.model_name),
+        "dataset_profile": dataset_profile,
+        "dataset_preview": dataframe.drop(columns=["target_raw"]).head(8),
+        "history": history_frame,
+        "pareto_front": pareto_frame,
+        "all_candidates": all_candidates_frame,
+        "comparison_table": comparison_table,
+        "default_metrics": default_metrics,
+        "optimized_metrics": optimized_metrics,
+        "best_hyperparameters": dict(optimization_result.selected_candidate.hyperparameters),
+        "formatted_hyperparameters": format_hyperparameters(optimization_result.selected_candidate.hyperparameters),
+        "default_hyperparameters": format_hyperparameters(default_hyperparameters),
+        "prediction_pipeline": optimized_prediction_pipeline,
+        "default_prediction_pipeline": default_prediction_pipeline,
+        "completed_generations": optimization_result.completed_generations,
+        "stopped_early": optimization_result.stopped_early,
+        "tradeoff_improvement": {
+            "validation_accuracy_change_pct": calculate_percentage_change(
+                optimized_metrics["validation_accuracy"],
+                default_metrics["validation_accuracy"],
+            ),
+            "validation_time_change_pct": calculate_percentage_change(
+                optimized_metrics["validation_training_time"],
+                default_metrics["validation_training_time"],
+                invert=True,
+            ),
+            "test_accuracy_change_pct": calculate_percentage_change(
+                optimized_metrics["test_accuracy"],
+                default_metrics["test_accuracy"],
+            ),
+            "test_time_change_pct": calculate_percentage_change(
+                optimized_metrics["test_training_time"],
+                default_metrics["test_training_time"],
+                invert=True,
+            ),
+        },
+        "summary_text": (
+            f"{get_model_label(config.model_name)} moved from "
+            f"{format_percent(default_metrics['test_accuracy'])} to "
+            f"{format_percent(optimized_metrics['test_accuracy'])} on the held-out test set, "
+            f"while training time moved from {format_seconds(default_metrics['test_training_time'])} "
+            f"to {format_seconds(optimized_metrics['test_training_time'])}."
+        ),
+    }
+    return result
+
+
+def save_results(result: dict[str, Any], output_dir: str | Path) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_dir / "latest_results.json"
+    history_path = output_dir / "generation_history.csv"
+    pareto_path = output_dir / "pareto_front.csv"
+
+    with json_path.open("w", encoding="utf-8") as file:
+        json.dump(_serialise_for_json(result), file, indent=2, default=_json_default)
+
+    result["history"].to_csv(history_path, index=False)
+    result["pareto_front"].to_csv(pareto_path, index=False)
+    return json_path
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run a Genetic Algorithm for accuracy-time optimization on the UCI Heart Disease dataset."
+    )
+    parser.add_argument(
+        "--model",
+        choices=["logistic_regression", "random_forest"],
+        default="logistic_regression",
+        help="Model family to optimize.",
+    )
+    parser.add_argument("--population-size", type=int, default=28, help="Number of chromosomes per generation.")
+    parser.add_argument("--generations", type=int, default=18, help="Maximum number of GA generations.")
+    parser.add_argument("--mutation-rate", type=float, default=0.18, help="Per-gene mutation probability.")
+    parser.add_argument("--output-dir", default="outputs", help="Directory used to store generated result files.")
+    return parser
+
+
+def print_cli_summary(result: dict[str, Any], output_path: Path) -> None:
+    default_metrics = result["default_metrics"]
+    optimized_metrics = result["optimized_metrics"]
+
+    print("=" * 72)
+    print("CardioGA Optimization Report")
+    print("=" * 72)
+    print(f"Model Family          : {result['model_label']}")
+    print(f"Completed Generations : {result['completed_generations']}")
+    print(f"Stopped Early         : {result['stopped_early']}")
+    print()
+    print("Default vs Optimized")
+    print(f"  Validation Accuracy : {format_percent(default_metrics['validation_accuracy'])} -> {format_percent(optimized_metrics['validation_accuracy'])}")
+    print(f"  Validation Time     : {format_seconds(default_metrics['validation_training_time'])} -> {format_seconds(optimized_metrics['validation_training_time'])}")
+    print(f"  Test Accuracy       : {format_percent(default_metrics['test_accuracy'])} -> {format_percent(optimized_metrics['test_accuracy'])}")
+    print(f"  Test Time           : {format_seconds(default_metrics['test_training_time'])} -> {format_seconds(optimized_metrics['test_training_time'])}")
+    print(f"  Composite Fitness   : {default_metrics['fitness']:.4f} -> {optimized_metrics['fitness']:.4f}")
+    print()
+    print("Selected Hyperparameters")
+    for key, value in result["formatted_hyperparameters"].items():
+        print(f"  {key:18}: {value}")
+    print()
+    print(result["summary_text"])
+    print(f"Saved outputs to      : {output_path}")
+
+
+def main() -> None:
+    parser = build_cli_parser()
+    arguments = parser.parse_args()
+
+    config = ExperimentConfig(
+        model_name=arguments.model,
+        population_size=arguments.population_size,
+        generations=arguments.generations,
+        mutation_rate=arguments.mutation_rate,
+    )
+    result = run_experiment(config)
+    output_path = save_results(result, arguments.output_dir)
+    print_cli_summary(result, output_path)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+generation,source,validation_accuracy,training_time,time_score,composite_fitness,pareto_rank,crowding_distance,model_label,n_estimators,max_depth,min_samples_split,min_samples_leaf,max_features,bootstrap
+10,offspring,0.8524590163934426,0.047147300000006,0.6852643897153005,0.822363983591377,0,inf,Random Forest,60,3,14,1,sqrt,False
+8,offspring,0.819672131147541,0.0462580999999318,0.6893563583500539,0.7962152920439933,0,inf,Random Forest,60,3,14,2,log2,False
+9,offspring,0.8360655737704918,0.04713220000007823,0.6853334721993154,0.8089337954876801,0,2.0,Random Forest,60,3,14,2,sqrt,False

@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from utils import CATEGORICAL_FEATURES, NUMERIC_FEATURES
+
+
+MODEL_LABELS = {
+    "logistic_regression": "Logistic Regression",
+    "random_forest": "Random Forest",
+}
+
+
+@dataclass(frozen=True)
+class GeneSpec:
+    name: str
+    kind: str
+    low: float | int | None = None
+    high: float | int | None = None
+    choices: tuple[Any, ...] | None = None
+    scale: str = "linear"
+    step: float | int | None = None
+
+    def sample(self, rng) -> Any:
+        if self.kind == "categorical":
+            return rng.choice(self.choices)
+
+        if self.kind == "int":
+            if self.step:
+                values = list(range(int(self.low), int(self.high) + int(self.step), int(self.step)))
+                return int(rng.choice(values))
+            return int(rng.integers(int(self.low), int(self.high) + 1))
+
+        if self.kind == "float":
+            if self.scale == "log":
+                lower = math.log10(float(self.low))
+                upper = math.log10(float(self.high))
+                return float(10 ** rng.uniform(lower, upper))
+            return float(rng.uniform(float(self.low), float(self.high)))
+
+        raise ValueError(f"Unsupported gene kind: {self.kind}")
+
+    def mutate(self, value: Any, rng) -> Any:
+        if self.kind == "categorical":
+            if not self.choices or len(self.choices) == 1:
+                return value
+            alternatives = [choice for choice in self.choices if choice != value]
+            return rng.choice(alternatives)
+
+        if self.kind == "int":
+            span = max(1, int(self.high) - int(self.low))
+            step = int(self.step or max(1, round(span * 0.15)))
+            direction = rng.choice([-1, 1])
+            mutated = int(value) + direction * step
+            return int(min(max(mutated, int(self.low)), int(self.high)))
+
+        if self.kind == "float":
+            if self.scale == "log":
+                mutated = float(value) * float(math.exp(rng.normal(0, 0.35)))
+            else:
+                sigma = (float(self.high) - float(self.low)) * 0.12
+                mutated = float(value) + float(rng.normal(0, sigma))
+            return float(min(max(mutated, float(self.low)), float(self.high)))
+
+        raise ValueError(f"Unsupported gene kind: {self.kind}")
+
+
+MODEL_SEARCH_SPACES: dict[str, list[GeneSpec]] = {
+    "logistic_regression": [
+        GeneSpec("C", "float", low=0.01, high=25.0, scale="log"),
+        GeneSpec("penalty", "categorical", choices=("l1", "l2")),
+        GeneSpec("max_iter", "int", low=150, high=650, step=50),
+        GeneSpec("class_weight", "categorical", choices=(None, "balanced")),
+        GeneSpec("tol", "float", low=1e-5, high=1e-2, scale="log"),
+    ],
+    "random_forest": [
+        GeneSpec("n_estimators", "int", low=60, high=320, step=20),
+        GeneSpec("max_depth", "int", low=3, high=18),
+        GeneSpec("min_samples_split", "int", low=2, high=14),
+        GeneSpec("min_samples_leaf", "int", low=1, high=8),
+        GeneSpec("max_features", "categorical", choices=("sqrt", "log2", None)),
+        GeneSpec("bootstrap", "categorical", choices=(True, False)),
+    ],
+}
+
+DEFAULT_HYPERPARAMETERS: dict[str, dict[str, Any]] = {
+    "logistic_regression": {
+        "C": 1.0,
+        "penalty": "l2",
+        "max_iter": 250,
+        "class_weight": None,
+        "tol": 1e-4,
+    },
+    "random_forest": {
+        "n_estimators": 100,
+        "max_depth": 8,
+        "min_samples_split": 2,
+        "min_samples_leaf": 1,
+        "max_features": "sqrt",
+        "bootstrap": True,
+    },
+}
+
+
+def get_model_label(model_name: str) -> str:
+    return MODEL_LABELS[model_name]
+
+
+def get_default_hyperparameters(model_name: str) -> dict[str, Any]:
+    return dict(DEFAULT_HYPERPARAMETERS[model_name])
+
+
+def get_search_space(model_name: str) -> list[GeneSpec]:
+    return MODEL_SEARCH_SPACES[model_name]
+
+
+def sample_hyperparameters(model_name: str, rng) -> dict[str, Any]:
+    return {gene.name: gene.sample(rng) for gene in get_search_space(model_name)}
+
+
+def chromosome_key(model_name: str, hyperparameters: dict[str, Any]) -> tuple[Any, ...]:
+    ordered_values = []
+    for gene in get_search_space(model_name):
+        value = hyperparameters[gene.name]
+        if isinstance(value, float):
+            ordered_values.append(round(value, 10))
+        else:
+            ordered_values.append(value)
+    return tuple(ordered_values)
+
+
+def crossover_hyperparameters(
+    model_name: str,
+    parent_a: dict[str, Any],
+    parent_b: dict[str, Any],
+    rng,
+) -> dict[str, Any]:
+    child: dict[str, Any] = {}
+    for gene in get_search_space(model_name):
+        child[gene.name] = parent_a[gene.name] if rng.random() < 0.5 else parent_b[gene.name]
+    return child
+
+
+def mutate_hyperparameters(
+    model_name: str,
+    hyperparameters: dict[str, Any],
+    mutation_rate: float,
+    rng,
+) -> dict[str, Any]:
+    mutated = dict(hyperparameters)
+    for gene in get_search_space(model_name):
+        if rng.random() < mutation_rate:
+            mutated[gene.name] = gene.mutate(mutated[gene.name], rng)
+    return mutated
+
+
+def build_preprocessor(model_name: str) -> ColumnTransformer:
+    numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+    if model_name == "logistic_regression":
+        numeric_steps.append(("scaler", StandardScaler()))
+
+    categorical_steps = [
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+    ]
+
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", Pipeline(steps=numeric_steps), NUMERIC_FEATURES),
+            ("categorical", Pipeline(steps=categorical_steps), CATEGORICAL_FEATURES),
+        ]
+    )
+
+
+def build_estimator(model_name: str, hyperparameters: dict[str, Any], random_state: int = 42):
+    if model_name == "logistic_regression":
+        return LogisticRegression(
+            C=float(hyperparameters["C"]),
+            penalty=hyperparameters["penalty"],
+            solver="liblinear",
+            max_iter=int(hyperparameters["max_iter"]),
+            class_weight=hyperparameters["class_weight"],
+            tol=float(hyperparameters["tol"]),
+            random_state=random_state,
+        )
+
+    if model_name == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=int(hyperparameters["n_estimators"]),
+            max_depth=int(hyperparameters["max_depth"]),
+            min_samples_split=int(hyperparameters["min_samples_split"]),
+            min_samples_leaf=int(hyperparameters["min_samples_leaf"]),
+            max_features=hyperparameters["max_features"],
+            bootstrap=bool(hyperparameters["bootstrap"]),
+            random_state=random_state,
+            n_jobs=1,
+        )
+
+    raise ValueError(f"Unsupported model name: {model_name}")
+
+
+def build_pipeline(model_name: str, hyperparameters: dict[str, Any], random_state: int = 42) -> Pipeline:
+    return Pipeline(
+        steps=[
+            ("preprocessor", build_preprocessor(model_name)),
+            ("model", build_estimator(model_name, hyperparameters, random_state=random_state)),
+        ]
+    )
